@@ -22,7 +22,10 @@ static const char *TAG = "create_jobs_task";
 /* -------------------------------------------------------------------------
  * Bouw een ASIC job.
  * extranonce_2 = 0 (zero-padded door mining_build_asic_job).
- * current_version = de actieve version die naar de ASIC gaat.
+ *
+ * BELANGRIJK: voor hardware-rolling ASICs (BM1370) sturen we job->version
+ * als basis. De ASIC rolt intern binnen version_mask. We sturen NIET de
+ * host-side current_version, want die hoort bij software-rolling ASICs.
  * ---------------------------------------------------------------------- */
 static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE,
                                          const miner_job_t *job,
@@ -32,14 +35,15 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE,
     if (!job) return;
 
     asic_job_t next_job;
+    uint32_t effective_version = job->version;
 
-    // BELANGRIJK: gebruik altijd current_version, tenzij de pool
-    // version-rolling volledig verboden heeft (mask == 0).
-    // Zo krijgt de ASIC elke cyclus écht nieuwe work.
-    uint32_t effective_version = current_version;
-    if (job->version_mask == 0) {
-        effective_version = job->version;
+    if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling &&
+        !miner_job_is_rollable(job)) {
+        // Software version rolling (bv. BM1397)
+        effective_version = current_version;
     }
+    // Voor hardware-rolling ASICs blijft effective_version = job->version.
+    // De ASIC rolt zelf binnen version_mask — dat reset alleen bij clean job.
 
     if (!mining_build_asic_job(job, extranonce_2, effective_version, &next_job)) {
         ESP_LOGE(TAG, "Failed to build ASIC job");
@@ -56,9 +60,10 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE,
 
 /* -------------------------------------------------------------------------
  * Hoofd-taak:
- *   - extranonce_2 BLIJFT ALTIJD 0 (zero-padded)
- *   - version rolling loopt DOOR tot een true job (clean_jobs == true)
- *   - ALLEEN bij een true job resetten we version + extranonce_2
+ *   - extranonce_2 BLIJFT ALTIJD 0
+ *   - roll-state (HW: in de ASIC, SW: current_version) blijft doorlopen
+ *     tussen continuation jobs
+ *   - reset ALLEEN bij clean_jobs == true (nieuwe blockdata)
  * ---------------------------------------------------------------------- */
 void create_jobs_task(void *pvParameters)
 {
@@ -67,7 +72,7 @@ void create_jobs_task(void *pvParameters)
     uint32_t current_version_mask = 0;
     miner_job_t *current_work   = NULL;
     bool     current_work_sent  = false;
-    uint64_t extranonce_2       = 0;   // blijft permanent 0
+    uint64_t extranonce_2       = 0;    // permanent 0
     uint32_t current_version    = 0;
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
@@ -108,21 +113,26 @@ void create_jobs_task(void *pvParameters)
             }
 
             if (is_true_job) {
+                // ===== TRUE JOB: nieuwe blockdata =====
+                // Reset de SW roll-teller (voor HW rolling gebeurt dit
+                // automatisch in de ASIC door de nieuwe job).
                 ESP_LOGI(TAG,
                          "True job (new block data): reset version roll "
                          "(extranonce_2 blijft 0)");
-                extranonce_2    = 0;                    // blijft 0
-                current_version = new_work->version;    // reset
+                extranonce_2    = 0;
+                current_version = new_work->version;
 
                 if (GLOBAL_STATE->ASIC_initalized) {
                     difficulty_controller_update(GLOBAL_STATE);
                 }
             } else {
+                // ===== CONTINUATION JOB: NIET resetten =====
+                // De ASIC blijft intern doorrollen.
                 ESP_LOGI(TAG,
                          "Continuation job: keep rolling "
                          "(extranonce_2=0, version=0x%08" PRIx32 ")",
                          current_version);
-                // current_version NIET resetten — blijft doorrollen
+                // current_version NIET resetten
             }
 
             if (!new_work->clean_jobs && !is_true_job) {
@@ -135,8 +145,6 @@ void create_jobs_task(void *pvParameters)
             }
         }
 
-        // Stuur de job met de HUIDIGE current_version naar de ASIC.
-        // (Dus niet job->version voor hardware-rolling ASICs!)
         generate_work_from_miner_job(GLOBAL_STATE,
                                      current_work,
                                      extranonce_2,      // altijd 0
@@ -148,19 +156,23 @@ void create_jobs_task(void *pvParameters)
         current_work_sent = true;
 
         // -----------------------------------------------------------------
-        // HOST-SIDE VERSION ROLLING
-        // Omdat we extranonce_2 op 0 houden, is dit onze ENIGE bron van
-        // verse work voor de ASIC. Elke cyclus schuift current_version
-        // één stap op binnen de pool-mask.
+        // Alleen SW-rolling ASICs hebben host-side increment nodig.
+        // Voor HW-rolling ASICs laten we dit ONGEWIJZIGD (geen increment),
+        // want de ASIC doet het zelf. Als we hier zouden incrementeren,
+        // verandert de base version die we naar de ASIC sturen en dat
+        // breekt de precomputed job-data (zoals je in de log zag: diff 0.0).
         // -----------------------------------------------------------------
-        uint32_t mask = (current_work->version_mask != 0)
-                        ? current_work->version_mask
-                        : BIP320_VERSION_ROLLING_MASK;
-
-        if (mask != 0) {
-            // Eén stap per cyclus. De ASIC krijgt hierdoor elke 500 ms
-            // een andere effectieve version en vindt dus andere nonces.
-            current_version = increment_bitmask(current_version, mask);
+        if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling &&
+            miner_job_is_rollable(current_work)) {
+            uint32_t mask = (current_work->version_mask != 0)
+                            ? current_work->version_mask
+                            : BIP320_VERSION_ROLLING_MASK;
+            uint8_t midstates =
+                GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
+            if (midstates == 0) midstates = 1;
+            for (int i = 0; i < midstates; i++) {
+                current_version = increment_bitmask(current_version, mask);
+            }
         }
 
         timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
