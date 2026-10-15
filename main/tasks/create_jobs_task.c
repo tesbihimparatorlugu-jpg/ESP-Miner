@@ -23,17 +23,22 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_
 {
     if (!job) return;
 
-    // Optioneel: Als je extranonce_2 ergens als hex-string wilt loggen of tonen:
+    // Draai de bytes om van links naar rechts (Endianness swap)
+    uint64_t flipped_extranonce_2 = __builtin_bswap64(extranonce_2);
+
+    // Optioneel loggen om te controleren hoe de omgedraaide extranonce 2 eruitziet
     char extranonce_str[17];
-    snprintf(extranonce_str, sizeof(extranonce_str), "%016" PRIx64, extranonce_2);
-    // ESP_LOGD(TAG, "Huidige Extranonce 2 (hex): %s", extranonce_str);
+    snprintf(extranonce_str, sizeof(extranonce_str), "%016" PRIx64, flipped_extranonce_2);
+    // ESP_LOGD(TAG, "Extranonce 2 (links naar rechts): %s", extranonce_str);
 
     asic_job_t next_job;
     uint32_t effective_version = job->version;
     if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling && !miner_job_is_rollable(job)) {
         effective_version = current_version;
     }
-    if (!mining_build_asic_job(job, extranonce_2, effective_version, &next_job)) {
+    
+    // Geef de omgedraaide extranonce_2 mee aan de ASIC job builder
+    if (!mining_build_asic_job(job, flipped_extranonce_2, effective_version, &next_job)) {
         ESP_LOGE(TAG, "Failed to build ASIC job");
         return;
     }
@@ -71,9 +76,10 @@ void create_jobs_task(void *pvParameters)
         if (notified == pdTRUE) {
             miner_job_t *new_work = miner_job_get_slot((size_t)slot_notify);
             
-            // Formatteer extranonce_2 met voorloopnullen voor schone logging
+            // Formatteer de omgedraaide extranonce_2 voor schone logging
+            uint64_t flipped_en2 = __builtin_bswap64(extranonce_2);
             char en2_str[17];
-            snprintf(en2_str, sizeof(en2_str), "%016" PRIx64, extranonce_2);
+            snprintf(en2_str, sizeof(en2_str), "%016" PRIx64, flipped_en2);
             
             ESP_LOGI(TAG, "New Work Activated (slot %lu) %s (type %d) [Extranonce 2: %s]", 
                      (unsigned long)slot_notify, new_work->job_id, new_work->type, en2_str);
