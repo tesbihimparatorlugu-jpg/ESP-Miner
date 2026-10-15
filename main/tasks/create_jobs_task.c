@@ -19,26 +19,26 @@
 
 static const char *TAG = "create_jobs_task";
 
+// ---------------------------------------------------------------------------
+// Extranonce_2 increment: little-endian, LSB (rechts) eerst.
+// Voorbeeld: 0x00000001 -> 0x00000002 -> ... -> 0x000000FF -> 0x00000100
+// Werkt op een uint64_t. Bij overflow van het hele veld wraps hij naar 0.
+// ---------------------------------------------------------------------------
+static inline void extranonce_2_increment(uint64_t *en2)
+{
+    (*en2)++;   // uint64_t++ telt al vanaf de LSB (rechts) op
+}
+
 static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_job_t *job, uint64_t extranonce_2, uint32_t current_version)
 {
     if (!job) return;
-
-    // Draai de bytes om van links naar rechts (Endianness swap)
-    uint64_t flipped_extranonce_2 = __builtin_bswap64(extranonce_2);
-
-    // Optioneel loggen om te controleren hoe de omgedraaide extranonce 2 eruitziet
-    char extranonce_str[17];
-    snprintf(extranonce_str, sizeof(extranonce_str), "%016" PRIx64, flipped_extranonce_2);
-    // ESP_LOGD(TAG, "Extranonce 2 (links naar rechts): %s", extranonce_str);
 
     asic_job_t next_job;
     uint32_t effective_version = job->version;
     if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling && !miner_job_is_rollable(job)) {
         effective_version = current_version;
     }
-    
-    // Geef de omgedraaide extranonce_2 mee aan de ASIC job builder
-    if (!mining_build_asic_job(job, flipped_extranonce_2, effective_version, &next_job)) {
+    if (!mining_build_asic_job(job, extranonce_2, effective_version, &next_job)) {
         ESP_LOGE(TAG, "Failed to build ASIC job");
         return;
     }
@@ -53,8 +53,8 @@ void create_jobs_task(void *pvParameters)
 {
     GlobalState *GLOBAL_STATE = (GlobalState *)pvParameters;
 
-    // active_jobs / valid_jobs are allocated and zeroed by SYSTEM_init_system(),
-    // before any task that touches them can run.
+    // active_jobs / valid_jobs zijn gealloceerd en op nul gezet door SYSTEM_init_system(),
+    // voordat een taak die ze aanraakt kan draaien.
 
     uint32_t current_version_mask = 0;
     miner_job_t *current_work = NULL;
@@ -75,15 +75,7 @@ void create_jobs_task(void *pvParameters)
 
         if (notified == pdTRUE) {
             miner_job_t *new_work = miner_job_get_slot((size_t)slot_notify);
-            
-            // Formatteer de omgedraaide extranonce_2 voor schone logging
-            uint64_t flipped_en2 = __builtin_bswap64(extranonce_2);
-            char en2_str[17];
-            snprintf(en2_str, sizeof(en2_str), "%016" PRIx64, flipped_en2);
-            
-            ESP_LOGI(TAG, "New Work Activated (slot %lu) %s (type %d) [Extranonce 2: %s]", 
-                     (unsigned long)slot_notify, new_work->job_id, new_work->type, en2_str);
-            
+            ESP_LOGI(TAG, "New Work Activated (slot %lu) %s (type %d)", (unsigned long)slot_notify, new_work->job_id, new_work->type);
             current_work = new_work;
             GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
             current_work_sent = false;
@@ -101,8 +93,8 @@ void create_jobs_task(void *pvParameters)
                 difficulty_controller_update(GLOBAL_STATE);
             }
 
-            if (!new_work->clean_jobs) {
-                // Staged job for next cycle, let current ASIC cycle finish
+            if (!current_work->clean_jobs) {
+                // Staged job voor de volgende cyclus, laat de huidige ASIC-cyclus aflopen
                 continue;
             }
         } else {
@@ -123,9 +115,10 @@ void create_jobs_task(void *pvParameters)
         current_work_sent = true;
 
         if (miner_job_is_rollable(current_work)) {
-            extranonce_2++;
+            // Van rechts naar links ophogen: 00000001, 00000002, 00000003, ...
+            extranonce_2_increment(&extranonce_2);
         } else if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
-            // Software version rolling for ASICs without hardware version rolling (e.g. BM1397) on SV2 Standard Channel
+            // Software version rolling voor ASICs zonder hardware version rolling (bv. BM1397) op SV2 Standard Channel
             uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
             uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
             for (int i = 0; i < midstates; i++) {
