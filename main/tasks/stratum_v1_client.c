@@ -68,7 +68,13 @@ int stratum_v1_submit_share(GlobalState *GLOBAL_STATE, const asic_job_t *active_
                             uint32_t nonce, uint32_t rolled_version, uint64_t *sent_time_us)
 {
     if (!GLOBAL_STATE || !active_job) return -1;
-    uint32_t version_bits = rolled_version ^ active_job->version;
+
+    // De pool verwacht: version_bits = rolled_version XOR (originele pool-versie).
+    // active_job->version is bij ons de doorgerolde basis (bv. 0x21800000),
+    // dus halen we eerst de originele pool-versie terug door de roll-bits
+    // eruit te maskeren (bv. 0x20000000).
+    uint32_t pool_base_version = active_job->version & ~active_job->version_mask;
+    uint32_t version_bits = rolled_version ^ pool_base_version;
 
     pthread_mutex_lock(&GLOBAL_STATE->transport_mutex);
     esp_transport_handle_t transport = GLOBAL_STATE->transport;
