@@ -20,20 +20,9 @@
 static const char *TAG = "create_jobs_task";
 
 // ============================================================
-// Extranonce2 helpers
+// Extranonce2 byte-swap (8-byte)
 // ============================================================
-
-// 4-byte swap
-static inline uint32_t extranonce_2_swap32(uint32_t x)
-{
-    return ((x & 0x000000FFu) << 24) |
-           ((x & 0x0000FF00u) <<  8) |
-           ((x & 0x00FF0000u) >>  8) |
-           ((x & 0xFF000000u) >> 24);
-}
-
-// 8-byte swap
-static inline uint64_t extranonce_2_swap64(uint64_t v)
+static inline uint64_t extranonce_2_byteswap(uint64_t v)
 {
     return ((v & 0x00000000000000FFULL) << 56) |
            ((v & 0x000000000000FF00ULL) << 40) |
@@ -45,20 +34,9 @@ static inline uint64_t extranonce_2_swap64(uint64_t v)
            ((v & 0xFF00000000000000ULL) >> 56);
 }
 
-// Slimme encode op basis van pool-lengte:
-//  - 8-byte pools (solofury, public-pool V1/V2): 8-byte swap
-//  - 4-byte pools (btcpowlab):                   4-byte swap
-static inline uint64_t extranonce_2_encode(uint64_t v, int len)
-{
-    if (len >= 8) return extranonce_2_swap64(v);
-    if (len == 4) return (uint64_t)extranonce_2_swap32((uint32_t)v);
-    return v;
-}
-
 // ============================================================
 // Work generation
 // ============================================================
-
 static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE,
                                          const miner_job_t *job,
                                          uint64_t extranonce_2,
@@ -69,8 +47,9 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE,
     asic_job_t next_job;
     uint32_t effective_version = job->version;
 
-    // Voor HW-rollende ASICs gebruiken we de doorgerolde software-versie,
-    // zodat de version-teller NIET reset naar 0 bij elke nieuwe job.
+    // Voor HW-rollende ASICs (BM1370 etc.) gebruiken we de doorgerolde
+    // software-versie, zodat de version-teller NIET naar 0 reset bij
+    // elke nieuwe ASIC-job.
     if (GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
         uint32_t mask = job->version_mask != 0
                         ? job->version_mask
@@ -82,19 +61,8 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE,
         }
     }
 
-    // Extranonce2 slim encoderen op basis van pool-lengte.
-    //
-    // !!! PAS DIT AAN als jouw project een andere veldnaam gebruikt !!!
-    // Zoek in je project naar waar "extranonce_2_len" wordt gezet
-    // (bijv. in stratum_v1.c of stratum_api.c). Het veld zit meestal
-    // in GLOBAL_STATE en heet iets als:
-    //   stratum_extranonce_2_len  /  extranonce_2_len  /  pool_extranonce_2_len
-    int en2_len = GLOBAL_STATE->stratum_extranonce_2_len;
-    if (en2_len <= 0) en2_len = 8;  // fallback voor de zekerheid
-
-    uint64_t encoded_en2 = extranonce_2_encode(extranonce_2, en2_len);
-
-    if (!mining_build_asic_job(job, encoded_en2, effective_version, &next_job)) {
+    if (!mining_build_asic_job(job, extranonce_2_byteswap(extranonce_2),
+                               effective_version, &next_job)) {
         ESP_LOGE(TAG, "Failed to build ASIC job");
         return;
     }
@@ -108,7 +76,6 @@ static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE,
 // ============================================================
 // Hoofdtaak
 // ============================================================
-
 void create_jobs_task(void *pvParameters)
 {
     GlobalState *GLOBAL_STATE = (GlobalState *)pvParameters;
@@ -123,16 +90,14 @@ void create_jobs_task(void *pvParameters)
     ESP_LOGI(TAG, "ASIC Job Interval: %d ms", timeout_ms);
     ESP_LOGI(TAG, "ASIC Ready!");
 
-    // Hoeveel version-stappen per job-window doorschuiven.
-    // De ASIC rolt in één window (paar honderd ms) ongeveer 256-512
-    // versies door. Door de basis met deze stap op te hogen, dekt
-    // elke volgende job een NIEUWE slice van de version-ruimte.
+    // Aantal version-stappen per job-window.
+    // De ASIC rolt per window (~paar honderd ms) ongeveer 256-512
+    // versies. Door de basis telkens met deze stap op te hogen,
+    // dekt elke job een NIEUW stuk van de version-ruimte.
     //
-    //   0x100 (256)  → 256 windows om alle 65536 versies te dekken
+    //   0x100 (256)  → 256 windows voor alle 65536 versies
     //   0x200 (512)  → 128 windows
     //   0x400 (1024) →  64 windows
-    //
-    // Bij 500ms interval en 0x200: alle versies gedekt in ~64 seconden.
     const uint32_t VERSION_STEP = 0x00000200;
 
     while (1) {
@@ -148,13 +113,13 @@ void create_jobs_task(void *pvParameters)
                      (unsigned long)slot_notify, new_work->job_id,
                      new_work->type, new_work->clean_jobs);
 
-            // Non-clean job: negeren, huidige werk blijven rollen.
+            // Non-clean job: negeren, blijven rollen op huidige werk.
             if (!new_work->clean_jobs && current_work != NULL) {
                 ESP_LOGI(TAG, "Non-clean job, ignoring and continuing current work");
                 continue;
             }
 
-            // Clean job: echt wisselen en alles resetten.
+            // Clean job: wisselen en resetten.
             current_work = new_work;
             GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
             current_work_sent = false;
@@ -195,14 +160,13 @@ void create_jobs_task(void *pvParameters)
         if (GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling &&
             miner_job_is_rollable(current_work))
         {
-            // HW-rollende ASIC (bijv. BM1370):
+            // HW-rollende ASIC (BM1370):
             //  - basis-versie opschuiven met VERSION_STEP
-            //  - en nieuwe extranonce2 per window → nieuwe merkle root
+            //  - nieuwe extranonce2 per window → nieuwe merkle root
             uint32_t mask = current_work->version_mask != 0
                             ? current_work->version_mask
                             : BIP320_VERSION_ROLLING_MASK;
 
-            // Stap VERSION_STEP keer door in de version-ruimte
             for (uint32_t i = 0; i < VERSION_STEP; i++) {
                 current_version = increment_bitmask(current_version, mask);
             }
@@ -214,7 +178,7 @@ void create_jobs_task(void *pvParameters)
             extranonce_2++;
 
         } else if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
-            // Software version rolling (bijv. BM1397)
+            // Software version rolling (BM1397 etc.)
             uint32_t mask = (current_work->version_mask != 0)
                             ? current_work->version_mask
                             : BIP320_VERSION_ROLLING_MASK;
