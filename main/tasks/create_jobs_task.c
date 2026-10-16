@@ -56,9 +56,6 @@ void create_jobs_task(void *pvParameters)
 {
     GlobalState *GLOBAL_STATE = (GlobalState *)pvParameters;
 
-    // active_jobs / valid_jobs are allocated and zeroed by SYSTEM_init_system(),
-    // before any task that touches them can run.
-
     uint32_t current_version_mask = 0;
     miner_job_t *current_work = NULL;
     bool current_work_sent = false;
@@ -78,11 +75,22 @@ void create_jobs_task(void *pvParameters)
 
         if (notified == pdTRUE) {
             miner_job_t *new_work = miner_job_get_slot((size_t)slot_notify);
-            ESP_LOGI(TAG, "New Work Activated (slot %lu) %s (type %d)", (unsigned long)slot_notify, new_work->job_id, new_work->type);
+            ESP_LOGI(TAG, "New Work (slot %lu) %s (type %d, clean=%d)",
+                     (unsigned long)slot_notify, new_work->job_id,
+                     new_work->type, new_work->clean_jobs);
+
+            // Non-clean job: negeren en de huidige job blijven rollen.
+            if (!new_work->clean_jobs && current_work != NULL) {
+                ESP_LOGI(TAG, "Non-clean job, ignoring and continuing current work");
+                continue;
+            }
+
+            // Clean job: wisselen en resetten.
             current_work = new_work;
             GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
             current_work_sent = false;
             current_version = new_work->version;
+            extranonce_2 = 0;
 
             if (new_work->version_mask != current_version_mask && GLOBAL_STATE->ASIC_initalized) {
                 ESP_LOGI(TAG, "Set chip version rolls %i", (int)(new_work->version_mask >> 13));
@@ -90,15 +98,8 @@ void create_jobs_task(void *pvParameters)
                 current_version_mask = new_work->version_mask;
             }
 
-            extranonce_2 = 0;
-
             if (GLOBAL_STATE->ASIC_initalized) {
                 difficulty_controller_update(GLOBAL_STATE);
-            }
-
-            if (!current_work->clean_jobs) {
-                // Staged job for next cycle, let current ASIC cycle finish
-                continue;
             }
         } else {
             if (current_work == NULL) {
@@ -120,7 +121,6 @@ void create_jobs_task(void *pvParameters)
         if (miner_job_is_rollable(current_work)) {
             extranonce_2++;
         } else if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
-            // Software version rolling for ASICs without hardware version rolling (e.g. BM1397) on SV2 Standard Channel
             uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
             uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
             for (int i = 0; i < midstates; i++) {
