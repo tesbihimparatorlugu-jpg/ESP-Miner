@@ -70,10 +70,10 @@ void create_jobs_task(void *pvParameters)
         if (notified == pdTRUE) {
             miner_job_t *new_work = miner_job_get_slot((size_t)slot_notify);
             
-            // Controleer of de pool een non-clean job stuurt (clean_jobs = false).
-            // Zo ja, dan negeren we de reset en rollen we vrolijk door op de huidige job!
+            // Als de pool een job stuurt met clean_jobs = false, negeren we de reset 
+            // volledig en springen we direct door om door te rollen op de huidige job!
             if (new_work && !new_work->clean_jobs && current_work != NULL) {
-                ESP_LOGI(TAG, "Non-clean job ontvangen, negeren en doorrollen op huidige job");
+                ESP_LOGI(TAG, "Non-clean job ontvangen (false), genegeerd. We rollen door!");
                 goto continue_rolling;
             }
 
@@ -102,14 +102,14 @@ continue_rolling:
             continue;
         }
 
-        // Genereer en verzend het werk naar de ASIC met de huidige doorlopende state
+        // Genereer en verzend het werk naar de ASIC met de doorlopende extranonce_2
         generate_work_from_miner_job(GLOBAL_STATE, current_work, extranonce_2, current_version);
         if (!current_work_sent) {
             SYSTEM_decode_and_apply_coinbase(GLOBAL_STATE, current_work);
             current_work_sent = true;
         }
 
-        // Verhoog extranonce_2 of software bitmask zolang er geen nieuwe clean job binnenkomt
+        // Blijf consequent inkrementeren zolang er geen echte clean job langskomt
         if (miner_job_is_rollable(current_work)) {
             extranonce_2++;
         } else if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
