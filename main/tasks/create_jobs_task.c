@@ -43,9 +43,6 @@ void create_jobs_task(void *pvParameters)
 {
     GlobalState *GLOBAL_STATE = (GlobalState *)pvParameters;
 
-    // active_jobs / valid_jobs are allocated and zeroed by SYSTEM_init_system(),
-    // before any task that touches them can run.
-
     uint32_t current_version_mask = 0;
     miner_job_t *current_work = NULL;
     bool current_work_sent = false;
@@ -70,46 +67,49 @@ void create_jobs_task(void *pvParameters)
         if (notified == pdTRUE) {
             miner_job_t *new_work = miner_job_get_slot((size_t)slot_notify);
             
-            // Als de pool een job stuurt met clean_jobs = false, negeren we de reset 
-            // volledig en springen we direct door om door te rollen op de huidige job!
-            if (new_work && !new_work->clean_jobs && current_work != NULL) {
-                ESP_LOGI(TAG, "Non-clean job ontvangen (false), genegeerd. We rollen door!");
-                goto continue_rolling;
-            }
+            if (new_work) {
+                if (!new_work->clean_jobs && current_work != NULL) {
+                    // Non-clean job: Job pointer güncelleniyor (yeni job_id kullanımı için),
+                    // ancak extranonce_2 ve version state'i KESİNLİKLE sıfırlanmıyor!
+                    ESP_LOGI(TAG, "Non-clean job (false): job_id güncellendi, rolling state korundu.");
+                    current_work = new_work;
+                    GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
+                    current_work_sent = false;
+                } else {
+                    // Clean job (true): Tamamen yeni blok, her şeyi sıfırla
+                    ESP_LOGI(TAG, "Clean Job (true) ontvangen! Activatie nieuwe job (slot %lu) %s", (unsigned long)slot_notify, new_work->job_id);
+                    current_work = new_work;
+                    GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
+                    current_work_sent = false;
+                    current_version = new_work->version;
+                    extranonce_2 = 0; // Sadece burada sıfırlanır
+                }
 
-            ESP_LOGI(TAG, "Clean Job (true) ontvangen! Activatie nieuwe job (slot %lu) %s (type %d)", (unsigned long)slot_notify, new_work->job_id, new_work->type);
-            
-            current_work = new_work;
-            GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
-            current_work_sent = false;
-            current_version = new_work->version;
-            extranonce_2 = 0; // Alleen resetten bij een echte schone job (true)!
+                if (new_work->version_mask != current_version_mask && GLOBAL_STATE->ASIC_initalized) {
+                    ESP_LOGI(TAG, "Set chip version rolls %i", (int)(new_work->version_mask >> 13));
+                    ASIC_set_version_mask(GLOBAL_STATE, new_work->version_mask);
+                    current_version_mask = new_work->version_mask;
+                }
 
-            if (new_work->version_mask != current_version_mask && GLOBAL_STATE->ASIC_initalized) {
-                ESP_LOGI(TAG, "Set chip version rolls %i", (int)(new_work->version_mask >> 13));
-                ASIC_set_version_mask(GLOBAL_STATE, new_work->version_mask);
-                current_version_mask = new_work->version_mask;
-            }
-
-            if (GLOBAL_STATE->ASIC_initalized) {
-                difficulty_controller_update(GLOBAL_STATE);
+                if (GLOBAL_STATE->ASIC_initalized) {
+                    difficulty_controller_update(GLOBAL_STATE);
+                }
             }
         }
 
-continue_rolling:
         if (current_work == NULL) {
             vTaskDelay(100 / portTICK_PERIOD_MS);
             continue;
         }
 
-        // Genereer en verzend het werk naar de ASIC met de doorlopende extranonce_2
+        // Çalışmayı ASIC'e gönder
         generate_work_from_miner_job(GLOBAL_STATE, current_work, extranonce_2, current_version);
         if (!current_work_sent) {
             SYSTEM_decode_and_apply_coinbase(GLOBAL_STATE, current_work);
             current_work_sent = true;
         }
 
-        // Blijf consequent inkrementeren zolang er geen echte clean job langskomt
+        // Sayaçları artırmaya devam et
         if (miner_job_is_rollable(current_work)) {
             extranonce_2++;
         } else if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
