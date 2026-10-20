@@ -19,6 +19,9 @@
 
 static const char *TAG = "create_jobs_task";
 
+// Gouden ratio constante voor 64-bit integer jumps (Golden Ratio Conjugate: 2^64 / phi)
+#define GOLDEN_RATIO_STEP 0x9E3779B97F4A7C15ULL
+
 static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_job_t *job, uint64_t extranonce_2, uint32_t current_version)
 {
     if (!job) return;
@@ -70,7 +73,7 @@ void create_jobs_task(void *pvParameters)
             if (new_work) {
                 if (!new_work->clean_jobs && current_work != NULL) {
                     // Non-clean job: Job pointer güncelleniyor (yeni job_id kullanımı için),
-                    // ancak extranonce_2 ve version state'i KESİNLİKLE sıfırlanmıyor!
+                    // ancak extranonce_2 en version state'i KESİNLİKLE sıfırlanmıyor!
                     ESP_LOGI(TAG, "Non-clean job (false): job_id güncellendi, rolling state korundu.");
                     current_work = new_work;
                     GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
@@ -109,9 +112,9 @@ void create_jobs_task(void *pvParameters)
             current_work_sent = true;
         }
 
-        // Sayaçları artırmaya devam et
+        // Sayaçları artırmaya devam et (extranonce_2 verhoogt nu via Golden Ratio stap i.p.v. ++ )
         if (miner_job_is_rollable(current_work)) {
-            extranonce_2++;
+            extranonce_2 += GOLDEN_RATIO_STEP;
         } else if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
             uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
             uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
