@@ -60,8 +60,6 @@ void create_jobs_task(void *pvParameters)
         uint64_t start_time = esp_timer_get_time();
         uint32_t slot_notify = 0;
         
-        // Als timeout_ms <= 0, wachten we oneindig op een nieuwe job notificatie via portMAX_DELAY.
-        // Zo niet, dan gebruiken we de berekende timeout voor de job-frequentie.
         TickType_t wait_ticks = (timeout_ms > 0) ? pdMS_TO_TICKS(timeout_ms) : portMAX_DELAY;
         BaseType_t notified = xTaskNotifyWait(0, ULONG_MAX, &slot_notify, wait_ticks);
         
@@ -70,15 +68,22 @@ void create_jobs_task(void *pvParameters)
         }
 
         if (notified == pdTRUE) {
-            // GLOEDNIEUWE JOB VAN DE POOL: Pas hier resetten we en schakelen we over.
             miner_job_t *new_work = miner_job_get_slot((size_t)slot_notify);
-            ESP_LOGI(TAG, "New Work Activated (slot %lu) %s (type %d)", (unsigned long)slot_notify, new_work->job_id, new_work->type);
+            
+            // Controleer of de pool een non-clean job stuurt (clean_jobs = false).
+            // Zo ja, dan negeren we de reset en rollen we vrolijk door op de huidige job!
+            if (new_work && !new_work->clean_jobs && current_work != NULL) {
+                ESP_LOGI(TAG, "Non-clean job ontvangen, negeren en doorrollen op huidige job");
+                goto continue_rolling;
+            }
+
+            ESP_LOGI(TAG, "Clean Job (true) ontvangen! Activatie nieuwe job (slot %lu) %s (type %d)", (unsigned long)slot_notify, new_work->job_id, new_work->type);
             
             current_work = new_work;
             GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
             current_work_sent = false;
             current_version = new_work->version;
-            extranonce_2 = 0; // Alleen resetten bij een echte nieuwe job!
+            extranonce_2 = 0; // Alleen resetten bij een echte schone job (true)!
 
             if (new_work->version_mask != current_version_mask && GLOBAL_STATE->ASIC_initalized) {
                 ESP_LOGI(TAG, "Set chip version rolls %i", (int)(new_work->version_mask >> 13));
@@ -89,23 +94,22 @@ void create_jobs_task(void *pvParameters)
             if (GLOBAL_STATE->ASIC_initalized) {
                 difficulty_controller_update(GLOBAL_STATE);
             }
+        }
 
-            // Direct verzenden van de eerste instantie
-            generate_work_from_miner_job(GLOBAL_STATE, current_work, extranonce_2, current_version);
+continue_rolling:
+        if (current_work == NULL) {
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+            continue;
+        }
+
+        // Genereer en verzend het werk naar de ASIC met de huidige doorlopende state
+        generate_work_from_miner_job(GLOBAL_STATE, current_work, extranonce_2, current_version);
+        if (!current_work_sent) {
             SYSTEM_decode_and_apply_coinbase(GLOBAL_STATE, current_work);
-            current_work_sent = true;
-        } else {
-            // GEEN NIEUWE JOB: Blijf doorrollen op de huidige job!
-            if (current_work == NULL) {
-                vTaskDelay(100 / portTICK_PERIOD_MS);
-                continue;
-            }
-
-            generate_work_from_miner_job(GLOBAL_STATE, current_work, extranonce_2, current_version);
             current_work_sent = true;
         }
 
-        // Blijf consequent inkrementeren zolang er geen nieuwe job binnenkomt
+        // Verhoog extranonce_2 of software bitmask zolang er geen nieuwe clean job binnenkomt
         if (miner_job_is_rollable(current_work)) {
             extranonce_2++;
         } else if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
