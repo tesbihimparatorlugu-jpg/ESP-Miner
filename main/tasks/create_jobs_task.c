@@ -59,17 +59,26 @@ void create_jobs_task(void *pvParameters)
     while (1) {
         uint64_t start_time = esp_timer_get_time();
         uint32_t slot_notify = 0;
-        TickType_t wait_ticks = (timeout_ms > 0) ? pdMS_TO_TICKS(timeout_ms) : 0;
+        
+        // Als timeout_ms <= 0, wachten we oneindig op een nieuwe job notificatie via portMAX_DELAY.
+        // Zo niet, dan gebruiken we de berekende timeout voor de job-frequentie.
+        TickType_t wait_ticks = (timeout_ms > 0) ? pdMS_TO_TICKS(timeout_ms) : portMAX_DELAY;
         BaseType_t notified = xTaskNotifyWait(0, ULONG_MAX, &slot_notify, wait_ticks);
-        timeout_ms -= (esp_timer_get_time() - start_time) / 1000;
+        
+        if (timeout_ms > 0) {
+            timeout_ms -= (esp_timer_get_time() - start_time) / 1000;
+        }
 
         if (notified == pdTRUE) {
+            // GLOEDNIEUWE JOB VAN DE POOL: Pas hier resetten we en schakelen we over.
             miner_job_t *new_work = miner_job_get_slot((size_t)slot_notify);
             ESP_LOGI(TAG, "New Work Activated (slot %lu) %s (type %d)", (unsigned long)slot_notify, new_work->job_id, new_work->type);
+            
             current_work = new_work;
             GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
             current_work_sent = false;
             current_version = new_work->version;
+            extranonce_2 = 0; // Alleen resetten bij een echte nieuwe job!
 
             if (new_work->version_mask != current_version_mask && GLOBAL_STATE->ASIC_initalized) {
                 ESP_LOGI(TAG, "Set chip version rolls %i", (int)(new_work->version_mask >> 13));
@@ -77,43 +86,36 @@ void create_jobs_task(void *pvParameters)
                 current_version_mask = new_work->version_mask;
             }
 
-            extranonce_2 = 0;
-
             if (GLOBAL_STATE->ASIC_initalized) {
                 difficulty_controller_update(GLOBAL_STATE);
             }
 
-            if (!current_work->clean_jobs) {
-                // Staged job for next cycle, let current ASIC cycle finish
-                continue;
-            }
+            // Direct verzenden van de eerste instantie
+            generate_work_from_miner_job(GLOBAL_STATE, current_work, extranonce_2, current_version);
+            SYSTEM_decode_and_apply_coinbase(GLOBAL_STATE, current_work);
+            current_work_sent = true;
         } else {
+            // GEEN NIEUWE JOB: Blijf doorrollen op de huidige job!
             if (current_work == NULL) {
                 vTaskDelay(100 / portTICK_PERIOD_MS);
                 continue;
             }
-            if (!miner_job_is_rollable(current_work) && current_work_sent && GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
-                timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
-                continue;
-            }
+
+            generate_work_from_miner_job(GLOBAL_STATE, current_work, extranonce_2, current_version);
+            current_work_sent = true;
         }
 
-        generate_work_from_miner_job(GLOBAL_STATE, current_work, extranonce_2, current_version);
-        if (!current_work_sent) {
-            SYSTEM_decode_and_apply_coinbase(GLOBAL_STATE, current_work);
-        }
-        current_work_sent = true;
-
+        // Blijf consequent inkrementeren zolang er geen nieuwe job binnenkomt
         if (miner_job_is_rollable(current_work)) {
             extranonce_2++;
         } else if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
-            // Software version rolling for ASICs without hardware version rolling (e.g. BM1397) on SV2 Standard Channel
             uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
             uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
             for (int i = 0; i < midstates; i++) {
                 current_version = increment_bitmask(current_version, mask);
             }
         }
+        
         timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
     }
 }
