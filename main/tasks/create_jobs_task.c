@@ -19,8 +19,16 @@
 
 static const char *TAG = "create_jobs_task";
 
-// Gouden ratio constante voor 64-bit integer jumps (Golden Ratio Conjugate: 2^64 / phi)
-#define GOLDEN_RATIO_STEP 0x9E3779B97F4A7C15ULL
+// Basis gouden ratio constante (2^64 / phi)
+#define BASE_GOLDEN_RATIO 0x9E3779B97F4A7C15ULL
+
+// Functie om op basis van een job teller een unieke, geldige oneven gouden-ratio stap te genereren (Weyl-sequentie)
+static uint64_t get_dynamic_golden_step(uint32_t job_counter) {
+    uint64_t mixer = 0xBF58476D1CE4E5B9ULL;
+    uint64_t derived_step = BASE_GOLDEN_RATIO + ((uint64_t)job_counter * mixer);
+    // Forceer het getal oneven zodat het coprime is aan 2^64 en de volledige periode behoudt
+    return derived_step | 1ULL;
+}
 
 static void generate_work_from_miner_job(GlobalState *GLOBAL_STATE, const miner_job_t *job, uint64_t extranonce_2, uint32_t current_version)
 {
@@ -51,6 +59,11 @@ void create_jobs_task(void *pvParameters)
     bool current_work_sent = false;
     uint64_t extranonce_2 = 0;
     uint32_t current_version = 0;
+    
+    // Dynamic golden ratio state variabelen
+    uint32_t clean_job_counter = 0;
+    uint64_t active_golden_step = BASE_GOLDEN_RATIO;
+
     int timeout_ms = ASIC_get_asic_job_frequency_ms(GLOBAL_STATE);
 
     ESP_LOGI(TAG, "ASIC Job Interval: %d ms", timeout_ms);
@@ -79,8 +92,13 @@ void create_jobs_task(void *pvParameters)
                     GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
                     current_work_sent = false;
                 } else {
-                    // Clean job (true): Tamamen yeni blok, her şeyi sıfırla
-                    ESP_LOGI(TAG, "Clean Job (true) ontvangen! Activatie nieuwe job (slot %lu) %s", (unsigned long)slot_notify, new_work->job_id);
+                    // Clean job (true): Tamamen yeni blok, her şeyi sıfırla en genereer nieuwe stap
+                    clean_job_counter++;
+                    active_golden_step = get_dynamic_golden_step(clean_job_counter);
+
+                    ESP_LOGI(TAG, "Clean Job (true) ontvangen! Activatie nieuwe job (slot %lu) %s | Nieuwe Golden Step: 0x%016llX", 
+                             (unsigned long)slot_notify, new_work->job_id, (unsigned long long)active_golden_step);
+                             
                     current_work = new_work;
                     GLOBAL_STATE->active_job_slot_idx = (uint8_t)(slot_notify % MINER_JOB_POOL_SIZE);
                     current_work_sent = false;
@@ -112,9 +130,9 @@ void create_jobs_task(void *pvParameters)
             current_work_sent = true;
         }
 
-        // Sayaçları artırmaya devam et (extranonce_2 verhoogt nu via Golden Ratio stap i.p.v. ++ )
+        // Sayaçları artırmaya devam et (extranonce_2 verhoogt nu via de dynamische Golden Ratio stap)
         if (miner_job_is_rollable(current_work)) {
-            extranonce_2 += GOLDEN_RATIO_STEP;
+            extranonce_2 += active_golden_step;
         } else if (!GLOBAL_STATE->DEVICE_CONFIG.family.asic.hardware_version_rolling) {
             uint32_t mask = (current_work->version_mask != 0) ? current_work->version_mask : BIP320_VERSION_ROLLING_MASK;
             uint8_t midstates = GLOBAL_STATE->DEVICE_CONFIG.family.asic.software_midstates;
